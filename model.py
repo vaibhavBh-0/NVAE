@@ -8,6 +8,8 @@
 
 import time
 import numpy as np
+from typing import Optional
+from enum import IntEnum
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -16,7 +18,7 @@ from neural_ar_operations import ARConv2d, ARInvertedResidual, MixLogCDFParam, m
 from neural_ar_operations import ELUConv as ARELUConv
 from torch.distributions.bernoulli import Bernoulli
 
-from utils import get_stride_for_cell_type, get_input_size, groups_per_scale
+from utils import get_stride_for_cell_type, get_input_size, groups_per_scale, permute_batches
 from distributions import Normal, DiscMixLogistic, NormalDecoder
 from thirdparty.inplaced_sync_batchnorm import SyncBatchNormSwish
 
@@ -101,30 +103,105 @@ class PairedCellAR(nn.Module):
         return new_z, log_det1
 
 
+class Reshape(nn.Module):
+    def __init__(self, *args):
+        super(Reshape, self).__init__()
+        self.shape = args
+
+    def forward(self, x):
+        return x.view(self.shape)
+
+
+class Discriminator(nn.Module):
+    def __init__(self, input_dim):
+        """
+        To reduce the Total Correlation between q(x) and q_bar(x).
+        The discriminator needs to confused between the two distributions?
+        """
+        super(Discriminator, self).__init__()
+
+        self.n = input_dim
+
+        self.model = nn.Sequential(*(
+            Reshape(*(-1, self.n)),
+            nn.Linear(self.n, 1000),
+            nn.LeakyReLU(inplace=True),
+            nn.Linear(1000, 1000),
+            nn.LeakyReLU(inplace=True),
+            nn.Linear(1000, 1),
+            # nn.Sigmoid()
+            # nn.LeakyReLU(inplace=True),
+            # nn.Linear(1000, 1000),
+            # nn.LeakyReLU(inplace=True),
+            # nn.Linear(1000, 2),
+            # nn.Softmax(dim=-1)
+        ))
+
+        self.act = nn.Sigmoid()
+
+    def forward(self, x, logits_only: Optional[bool] = None):
+        logit = self.model(x)
+        if logits_only:
+            return logit
+        else:
+            out = self.act(logit)
+            return out, logit
+
+
+class TCType(IntEnum):
+    """
+    Total Correlation type. Used to signal the model how total correlation is being used.
+    """
+    NO_TC = 0
+    TC_VIA_PRODUCT_OF_GAUSSIAN_PRODUCTS = 1
+    TC_VIA_CAT_OF_SAMPLES = 2
+
+
 class AutoEncoder(nn.Module):
     def __init__(self, args, writer, arch_instance):
         super(AutoEncoder, self).__init__()
         self.writer = writer
         self.arch_instance = arch_instance
+        self.is_debug = args.cpu_debug
+        self.device = 'cpu' if self.is_debug else ('cuda' if torch.cuda.is_available() else 'cpu')
         self.dataset = args.dataset
         self.crop_output = self.dataset in {'mnist', 'omniglot', 'stacked_mnist'}
         self.use_se = args.use_se
         self.res_dist = args.res_dist
         self.num_bits = args.num_x_bits
 
-        self.num_latent_scales = args.num_latent_scales         # number of spatial scales that latent layers will reside
-        self.num_groups_per_scale = args.num_groups_per_scale   # number of groups of latent vars. per scale
-        self.num_latent_per_group = args.num_latent_per_group   # number of latent vars. per group
+        self.num_latent_scales = args.num_latent_scales  # number of spatial scales that latent layers will reside
+        self.num_groups_per_scale = args.num_groups_per_scale  # number of groups of latent vars. per scale
+        self.num_latent_per_group = args.num_latent_per_group  # number of latent vars. per group
         self.groups_per_scale = groups_per_scale(self.num_latent_scales, self.num_groups_per_scale, args.ada_groups,
                                                  minimum_groups=args.min_groups_per_scale)
 
         self.vanilla_vae = self.num_latent_scales == 1 and self.num_groups_per_scale == 1
 
+        self.tc_type = TCType(args.tc_type)
+
+        # Discriminator
+        # (200, 20, 8, 8) - MNIST
+        if self.dataset == 'mnist':
+            input_dim = self.num_latent_per_group * 8 * 8
+
+            if self.tc_type.value == TCType.TC_VIA_CAT_OF_SAMPLES.value:
+                input_dim *= self.num_groups_per_scale
+
+            self.D = Discriminator(input_dim=input_dim)
+        else:
+            raise NotImplementedError(f'Discriminator dimensionality not implemented for {self.dataset}')
+
+        self.noise_val = 0.0
+
+        self.gamma = args.gamma
+        self.batch_size = args.batch_size
+
         # encoder parameteres
         self.num_channels_enc = args.num_channels_enc
         self.num_channels_dec = args.num_channels_dec
         self.num_preprocess_blocks = args.num_preprocess_blocks  # block is defined as series of Normal followed by Down
-        self.num_preprocess_cells = args.num_preprocess_cells   # number of cells per block
+        self.num_preprocess_cells = args.num_preprocess_cells  # number of cells per block
         self.num_cell_per_cond_enc = args.num_cell_per_cond_enc  # number of cell for each conditional in encoder
 
         # decoder parameters
@@ -145,7 +222,8 @@ class AutoEncoder(nn.Module):
         prior_ftr0_size = (int(c_scaling * self.num_channels_dec), self.input_size // spatial_scaling,
                            self.input_size // spatial_scaling)
         self.prior_ftr0 = nn.Parameter(torch.rand(size=prior_ftr0_size), requires_grad=True)
-        self.z0_size = [self.num_latent_per_group, self.input_size // spatial_scaling, self.input_size // spatial_scaling]
+        self.z0_size = [self.num_latent_per_group, self.input_size // spatial_scaling,
+                        self.input_size // spatial_scaling]
 
         self.stem = self.init_stem()
         self.pre_process, mult = self.init_pre_process(mult=1)
@@ -191,6 +269,14 @@ class AutoEncoder(nn.Module):
         self.sr_u = {}
         self.sr_v = {}
         self.num_power_iter = 4
+
+    def disc_parameters(self):
+        return self.D.parameters()
+
+    def vae_parameters(self):
+        exclude = set(self.disc_parameters())
+
+        return (params for params in self.parameters() if params not in exclude)
 
     def init_stem(self):
         Cout = self.num_channels_enc
@@ -358,12 +444,14 @@ class AutoEncoder(nn.Module):
         combiner_cells_s.reverse()
 
         idx_dec = 0
-        ftr = self.enc0(s)                            # this reduces the channel dimension
+        ftr = self.enc0(s)  # this reduces the channel dimension
         param0 = self.enc_sampler[idx_dec](ftr)
         mu_q, log_sig_q = torch.chunk(param0, 2, dim=1)
-        dist = Normal(mu_q, log_sig_q)   # for the first approx. posterior
+        dist = Normal(mu_q, log_sig_q)  # for the first approx. posterior
         z, _ = dist.sample()
         log_q_conv = dist.log_p(z)
+
+        encoder_z_samples = [z]
 
         # apply normalizing flows
         nf_offset = 0
@@ -395,11 +483,16 @@ class AutoEncoder(nn.Module):
                     mu_p, log_sig_p = torch.chunk(param, 2, dim=1)
 
                     # form encoder
+                    # (200, 128, 8, 8)
                     ftr = combiner_cells_enc[idx_dec - 1](combiner_cells_s[idx_dec - 1], s)
+                    # (200, 40, 8, 8)
                     param = self.enc_sampler[idx_dec](ftr)
                     mu_q, log_sig_q = torch.chunk(param, 2, dim=1)
                     dist = Normal(mu_p + mu_q, log_sig_p + log_sig_q) if self.res_dist else Normal(mu_q, log_sig_q)
+                    # (200, 20, 8, 8)
                     z, _ = dist.sample()
+                    encoder_z_samples.append(z)
+
                     log_q_conv = dist.log_p(z)
                     # apply NF
                     for n in range(self.num_flows):
@@ -427,7 +520,66 @@ class AutoEncoder(nn.Module):
         for cell in self.post_process:
             s = cell(s)
 
-        logits = self.image_conditional(s)
+        # Divide the batch into two halves, one for the NVAE and other for discriminator.
+        s_vae, _ = s.split(split_size=self.batch_size)
+
+        logits = self.image_conditional(s_vae)
+
+        if self.tc_type.value == TCType.TC_VIA_PRODUCT_OF_GAUSSIAN_PRODUCTS.value:
+
+            # compute q(z|x) from all_q
+
+            # (200, 20, 8, 8)
+            vae_dist = Normal.from_product_of_normals(all_q)
+
+            # cat_z += self.noise_val * torch.randn_like(cat_z, device=cat_z.device)
+
+            z, _ = vae_dist.sample()
+        elif self.tc_type.value == TCType.TC_VIA_CAT_OF_SAMPLES.value:
+            z = torch.cat(encoder_z_samples, dim=-1)
+
+        if self.tc_type.value != TCType.NO_TC.value:
+            # compute q_bar(z|x) from all_q
+
+            # Divide the batch into two halves, one for the NVAE and other for discriminator.
+            # z = z.view(z.shape[0], -1)
+            z_vae, z_disc = z.split(split_size=self.batch_size)
+
+            # (200, 2)
+            z_out_vae, z_out_vae_logit = self.D(z_vae)
+
+            total_correlation_term = self.gamma * (z_out_vae / (1 - z_out_vae)).squeeze()
+
+            # total_correlation_term = - self.gamma * (z_out_vae[:, :1] - z_out_vae[:, 1:]).squeeze()
+
+            z_perm = permute_batches(z_disc.detach())
+
+            if self.is_debug:
+                latents_not_permuted = (z_perm == z_disc).sum()
+                latents_permuted = (z_perm != z_disc).sum()
+
+                print(f'latents permuted {latents_permuted} latents not permuted {latents_not_permuted}')
+
+            z_out_disc_logit = self.D(z_perm, logits_only=True)
+
+            target_dtype = torch.long if z_out_disc_logit.device == torch.device('cuda') else torch.float
+
+            target_0 = torch.zeros_like(z_out_disc_logit, dtype=target_dtype, device=z_out_disc_logit.device)
+            target_1 = torch.ones_like(z_out_vae_logit, dtype=target_dtype, device=z_out_vae_logit.device)
+
+            disc_loss = (F.binary_cross_entropy_with_logits(z_out_vae_logit, target_1) +
+                         F.binary_cross_entropy_with_logits(z_out_disc_logit, target_0)) / 2
+
+            # z_out = torch.cat([z_out_vae, z_out_disc])
+            # target = torch.zeros_like(z_out, dtype=target_dtype, device=z_out.device)
+            # target[self.batch_size:, :] = 1
+
+            # disc_loss = (F.cross_entropy(z_out_vae, target_1) + F.cross_entropy(1 - z_out_disc, target_1)) / 2
+
+            # disc_loss = F.cross_entropy(z_out, target)
+        else:
+            total_correlation_term = torch.zeros((), device=logits.device)
+            disc_loss = torch.zeros((), device=logits.device)
 
         # compute kl
         kl_all = []
@@ -435,21 +587,22 @@ class AutoEncoder(nn.Module):
         log_p, log_q = 0., 0.
         for q, p, log_q_conv, log_p_conv in zip(all_q, all_p, all_log_q, all_log_p):
             if self.with_nf:
-                kl_per_var = log_q_conv - log_p_conv
+                kl_per_var = (log_q_conv - log_p_conv)[:self.batch_size, :, :]
             else:
-                kl_per_var = q.kl(p)
+                kl_per_var = q.kl(p)[:self.batch_size, :, :]
 
             kl_diag.append(torch.mean(torch.sum(kl_per_var, dim=[2, 3]), dim=0))
             kl_all.append(torch.sum(kl_per_var, dim=[1, 2, 3]))
-            log_q += torch.sum(log_q_conv, dim=[1, 2, 3])
-            log_p += torch.sum(log_p_conv, dim=[1, 2, 3])
+            log_q += torch.sum(log_q_conv[:self.batch_size, :, :], dim=[1, 2, 3])
+            log_p += torch.sum(log_p_conv[:self.batch_size, :, :], dim=[1, 2, 3])
 
-        return logits, log_q, log_p, kl_all, kl_diag
+        return logits, log_q, log_p, kl_all, kl_diag, total_correlation_term, disc_loss
 
     def sample(self, num_samples, t):
         scale_ind = 0
         z0_size = [num_samples] + self.z0_size
-        dist = Normal(mu=torch.zeros(z0_size).cuda(), log_sigma=torch.zeros(z0_size).cuda(), temp=t)
+        dist = Normal(mu=torch.zeros(z0_size).to(device=self.device),
+                      log_sigma=torch.zeros(z0_size).to(device=self.device), temp=t)
         z, _ = dist.sample()
 
         idx_dec = 0
@@ -485,7 +638,8 @@ class AutoEncoder(nn.Module):
     def decoder_output(self, logits):
         if self.dataset in {'mnist', 'omniglot'}:
             return Bernoulli(logits=logits)
-        elif self.dataset in {'stacked_mnist', 'cifar10', 'celeba_64', 'celeba_256', 'imagenet_32', 'imagenet_64', 'ffhq',
+        elif self.dataset in {'stacked_mnist', 'cifar10', 'celeba_64', 'celeba_256', 'imagenet_32', 'imagenet_64',
+                              'ffhq',
                               'lsun_bedroom_128', 'lsun_bedroom_256', 'lsun_church_64', 'lsun_church_128'}:
             if self.num_mix_output == 1:
                 return NormalDecoder(logits, num_bits=self.num_bits)
@@ -498,7 +652,7 @@ class AutoEncoder(nn.Module):
         """ This method computes spectral normalization for all conv layers in parallel. This method should be called
          after calling the forward method of all the conv layers in each iteration. """
 
-        weights = {}   # a dictionary indexed by the shape of weights
+        weights = {}  # a dictionary indexed by the shape of weights
         for l in self.all_conv_layers:
             weight = l.weight_normalized
             weight_mat = weight.view(weight.size(0), -1)
@@ -514,8 +668,10 @@ class AutoEncoder(nn.Module):
                 num_iter = self.num_power_iter
                 if i not in self.sr_u:
                     num_w, row, col = weights[i].shape
-                    self.sr_u[i] = F.normalize(torch.ones(num_w, row).normal_(0, 1).cuda(), dim=1, eps=1e-3)
-                    self.sr_v[i] = F.normalize(torch.ones(num_w, col).normal_(0, 1).cuda(), dim=1, eps=1e-3)
+                    self.sr_u[i] = F.normalize(torch.ones(num_w, row).normal_(0, 1).to(device=self.device), dim=1,
+                                               eps=1e-3)
+                    self.sr_v[i] = F.normalize(torch.ones(num_w, col).normal_(0, 1).to(device=self.device), dim=1,
+                                               eps=1e-3)
                     # increase the number of iterations for the first time
                     num_iter = 10 * self.num_power_iter
 

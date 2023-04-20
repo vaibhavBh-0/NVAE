@@ -182,20 +182,41 @@ def get_cout(cin, stride):
     return cout
 
 
-def kl_balancer_coeff(num_scales, groups_per_scale, fun):
+def kl_balancer_coeff(num_scales, groups_per_scale, fun, is_debug):
     if fun == 'equal':
-        coeff = torch.cat([torch.ones(groups_per_scale[num_scales - i - 1]) for i in range(num_scales)], dim=0).cuda()
+        coeff = torch.cat([torch.ones(groups_per_scale[num_scales - i - 1]) for i in range(num_scales)], dim=0)
     elif fun == 'linear':
-        coeff = torch.cat([(2 ** i) * torch.ones(groups_per_scale[num_scales - i - 1]) for i in range(num_scales)], dim=0).cuda()
+        coeff = torch.cat([(2 ** i) * torch.ones(groups_per_scale[num_scales - i - 1]) for i in range(num_scales)], dim=0)
     elif fun == 'sqrt':
-        coeff = torch.cat([np.sqrt(2 ** i) * torch.ones(groups_per_scale[num_scales - i - 1]) for i in range(num_scales)], dim=0).cuda()
+        coeff = torch.cat([np.sqrt(2 ** i) * torch.ones(groups_per_scale[num_scales - i - 1]) for i in range(num_scales)], dim=0)
     elif fun == 'square':
-        coeff = torch.cat([np.square(2 ** i) / groups_per_scale[num_scales - i - 1] * torch.ones(groups_per_scale[num_scales - i - 1]) for i in range(num_scales)], dim=0).cuda()
+        coeff = torch.cat([np.square(2 ** i) / groups_per_scale[num_scales - i - 1] * torch.ones(groups_per_scale[num_scales - i - 1]) for i in range(num_scales)], dim=0)
     else:
         raise NotImplementedError
     # convert min to 1.
     coeff /= torch.min(coeff)
+
+    if not is_debug:
+        coeff = coeff.cuda()
+
     return coeff
+
+
+def permute_batches(z: torch.Tensor):
+    """
+    Shuffling latents for every channel.
+    Tensor should not have any gradients attached to it.
+    """
+    batch, _ = z.shape[:2]
+
+    perms = []
+
+    device = z.device
+    for c, z_c in enumerate(z.split(split_size=1, dim=1)):
+        idx = torch.randperm(batch, device=device)
+        perms.append(z_c[idx])
+
+    return torch.cat(perms, dim=1)
 
 
 def kl_per_group(kl_all):
@@ -290,7 +311,7 @@ def one_hot(indices, depth, dim):
     indices = indices.unsqueeze(dim)
     size = list(indices.size())
     size[dim] = depth
-    y_onehot = torch.zeros(size).cuda()
+    y_onehot = torch.zeros(size)
     y_onehot.zero_()
     y_onehot.scatter_(dim, indices, 1)
 

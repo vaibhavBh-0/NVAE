@@ -15,8 +15,10 @@ import torch.distributed as dist
 from torch.multiprocessing import Process
 from torch.cuda.amp import autocast, GradScaler
 
-from model import AutoEncoder
+from model import AutoEncoder, TCType
 from thirdparty.adamax import Adamax
+from torch.optim import Adam
+from torch.optim import Adamax as _Adamax
 import utils
 import datasets
 
@@ -28,8 +30,9 @@ def main(args):
     # ensures that weight initializations are all the same
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
-    torch.cuda.manual_seed(args.seed)
-    torch.cuda.manual_seed_all(args.seed)
+    if not args.cpu_debug:
+        torch.cuda.manual_seed(args.seed)
+        torch.cuda.manual_seed_all(args.seed)
 
     logging = utils.Logger(args.global_rank, args.save)
     writer = utils.Writer(args.global_rank, args.save)
@@ -43,23 +46,32 @@ def main(args):
     arch_instance = utils.get_arch_cells(args.arch_instance)
 
     model = AutoEncoder(args, writer, arch_instance)
-    model = model.cuda()
+    if not args.cpu_debug:
+        model = model.cuda()
 
     logging.info('args = %s', args)
     logging.info('param size = %fM ', utils.count_parameters_in_M(model))
     logging.info('groups per scale: %s, total_groups: %d', model.groups_per_scale, sum(model.groups_per_scale))
 
+    # disc_optimizer = Adam(model.disc_parameters())
+    disc_optimizer = _Adamax(model.disc_parameters(), lr=args.disc_learning_rate, weight_decay=args.weight_decay,
+                             eps=1e-3)
+    disc_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(disc_optimizer,
+                                                                float(args.epochs - args.warmup_epochs - 1),
+                                                                args.learning_rate_min)
+
     if args.fast_adamax:
         # Fast adamax has the same functionality as torch.optim.Adamax, except it is faster.
-        cnn_optimizer = Adamax(model.parameters(), args.learning_rate,
+        cnn_optimizer = Adamax(model.vae_parameters(), args.learning_rate,
                                weight_decay=args.weight_decay, eps=1e-3)
     else:
-        cnn_optimizer = torch.optim.Adamax(model.parameters(), args.learning_rate,
+        cnn_optimizer = torch.optim.Adamax(model.vae_parameters(), args.learning_rate,
                                            weight_decay=args.weight_decay, eps=1e-3)
 
     cnn_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         cnn_optimizer, float(args.epochs - args.warmup_epochs - 1), eta_min=args.learning_rate_min)
-    grad_scalar = GradScaler(2**10)
+    grad_scalar = GradScaler(2 ** 10)
+    disc_grad_scalar = GradScaler(2 ** 10)
 
     num_output = utils.num_output(args.dataset)
     bpd_coeff = 1. / np.log(2.) / num_output
@@ -71,13 +83,23 @@ def main(args):
         checkpoint = torch.load(checkpoint_file, map_location='cpu')
         init_epoch = checkpoint['epoch']
         model.load_state_dict(checkpoint['state_dict'])
-        model = model.cuda()
+        if not args.cpu_debug:
+            model = model.cuda()
+
         cnn_optimizer.load_state_dict(checkpoint['optimizer'])
+        disc_optimizer.load_state_dict(checkpoint['disc_optimizer'])
         grad_scalar.load_state_dict(checkpoint['grad_scalar'])
+        disc_grad_scalar.load_state_dict(checkpoint['disc_grad_scalar'])
         cnn_scheduler.load_state_dict(checkpoint['scheduler'])
+        disc_scheduler.load_state_dict(checkpoint['disc_scheduler'])
         global_step = checkpoint['global_step']
     else:
         global_step, init_epoch = 0, 0
+
+    max_steps = len(train_queue) * args.epochs
+    scale_val = 4.0
+    # Linear scheduling for noise
+    noise_factor = lambda global_batch_step: scale_val * (max_steps - global_batch_step) / max_steps
 
     for epoch in range(init_epoch, args.epochs):
         # update lrs.
@@ -87,14 +109,19 @@ def main(args):
 
         if epoch > args.warmup_epochs:
             cnn_scheduler.step()
+            disc_scheduler.step()
 
         # Logging.
         logging.info('epoch %d', epoch)
 
         # Training.
-        train_nelbo, global_step = train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_iters, writer, logging)
-        logging.info('train_nelbo %f', train_nelbo)
+        train_nelbo, train_tc, train_ndisc, global_step = train(train_queue, model, cnn_optimizer, disc_optimizer,
+                                                                grad_scalar, disc_grad_scalar, global_step, warmup_iters
+                                                                , writer, logging, epoch, noise_factor)
+        logging.info('train_nelbo %f %f', train_nelbo, train_ndisc)
         writer.add_scalar('train/nelbo', train_nelbo, global_step)
+        writer.add_scalar('train/tc', train_tc, global_step)
+        writer.add_scalar('train/ndisc', train_ndisc, global_step)
 
         model.eval()
         # generate samples less frequently
@@ -106,17 +133,22 @@ def main(args):
                 for t in [0.7, 0.8, 0.9, 1.0]:
                     logits = model.sample(num_samples, t)
                     output = model.decoder_output(logits)
-                    output_img = output.mean if isinstance(output, torch.distributions.bernoulli.Bernoulli) else output.sample(t)
+                    output_img = output.mean if isinstance(output,
+                                                           torch.distributions.bernoulli.Bernoulli) else output.sample(
+                        t)
                     output_tiled = utils.tile_image(output_img, n)
                     writer.add_image('generated_%0.1f' % t, output_tiled, global_step)
 
-            valid_neg_log_p, valid_nelbo = test(valid_queue, model, num_samples=10, args=args, logging=logging)
+            valid_neg_log_p, valid_nelbo, valid_tc = test(valid_queue, model, num_samples=10, args=args,
+                                                          logging=logging)
             logging.info('valid_nelbo %f', valid_nelbo)
+            logging.info('valid_tc %f', valid_tc)
             logging.info('valid neg log p %f', valid_neg_log_p)
             logging.info('valid bpd elbo %f', valid_nelbo * bpd_coeff)
             logging.info('valid bpd log p %f', valid_neg_log_p * bpd_coeff)
             writer.add_scalar('val/neg_log_p', valid_neg_log_p, epoch)
             writer.add_scalar('val/nelbo', valid_nelbo, epoch)
+            writer.add_scalar('val/tc', valid_tc, epoch)
             writer.add_scalar('val/bpd_log_p', valid_neg_log_p * bpd_coeff, epoch)
             writer.add_scalar('val/bpd_elbo', valid_nelbo * bpd_coeff, epoch)
 
@@ -130,27 +162,39 @@ def main(args):
                             'grad_scalar': grad_scalar.state_dict()}, checkpoint_file)
 
     # Final validation
-    valid_neg_log_p, valid_nelbo = test(valid_queue, model, num_samples=1000, args=args, logging=logging)
+    valid_neg_log_p, valid_nelbo, valid_tc = test(valid_queue, model, num_samples=1000, args=args, logging=logging)
     logging.info('final valid nelbo %f', valid_nelbo)
+    logging.info('final valid tc %f', valid_tc)
     logging.info('final valid neg log p %f', valid_neg_log_p)
     writer.add_scalar('val/neg_log_p', valid_neg_log_p, epoch + 1)
     writer.add_scalar('val/nelbo', valid_nelbo, epoch + 1)
+    writer.add_scalar('val/tc', valid_nelbo, epoch + 1)
     writer.add_scalar('val/bpd_log_p', valid_neg_log_p * bpd_coeff, epoch + 1)
     writer.add_scalar('val/bpd_elbo', valid_nelbo * bpd_coeff, epoch + 1)
     writer.close()
 
 
-def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_iters, writer, logging):
+def train(train_queue, model, cnn_optimizer, disc_optimizer, grad_scalar, disc_grad_scaler, global_step, warmup_iters,
+          writer, logging, epoch, noise_factor_scheduler):
     alpha_i = utils.kl_balancer_coeff(num_scales=model.num_latent_scales,
-                                      groups_per_scale=model.groups_per_scale, fun='square')
+                                      groups_per_scale=model.groups_per_scale, fun='square', is_debug=args.cpu_debug)
     nelbo = utils.AvgrageMeter()
+    ndisc = utils.AvgrageMeter()
+    ntc = utils.AvgrageMeter()
+
     model.train()
-    for step, x in enumerate(train_queue):
-        x = x[0] if len(x) > 1 else x
-        x = x.cuda()
+    for step, data in enumerate(train_queue):
+        x_vae = data[0][0] if len(data[0]) > 1 else data[0]
+        x_disc = data[1][0] if len(data[1]) > 1 else data[1]
+
+        x = torch.cat((x_vae, x_disc))
+
+        if not args.cpu_debug:
+            x = x.cuda()
 
         # change bit length
         x = utils.pre_process(x, args.num_x_bits)
+        x_vae = x.split(x_vae.shape[0])[0]
 
         # warm-up lr
         if global_step < warmup_iters:
@@ -158,47 +202,72 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
             for param_group in cnn_optimizer.param_groups:
                 param_group['lr'] = lr
 
+            lr = args.disc_learning_rate * float(global_step) / warmup_iters
+            for param_group in disc_optimizer.param_groups:
+                param_group['lr'] = lr
+
         # sync parameters, it may not be necessary
         if step % 100 == 0:
             utils.average_params(model.parameters(), args.distributed)
 
+        torch.cuda.empty_cache()
+
+        # global_batch_step = epoch * len(train_queue) + step
+        # model.noise_val = noise_factor_scheduler(global_batch_step)
+
         cnn_optimizer.zero_grad()
-        with autocast():
-            logits, log_q, log_p, kl_all, kl_diag = model(x)
+        disc_optimizer.zero_grad()
+        with autocast(enabled=not args.cpu_debug):
+            logits, log_q, log_p, kl_all, kl_diag, total_correlation_term, disc_loss = model(x)
 
             output = model.decoder_output(logits)
             kl_coeff = utils.kl_coeff(global_step, args.kl_anneal_portion * args.num_total_iter,
                                       args.kl_const_portion * args.num_total_iter, args.kl_const_coeff)
 
-            recon_loss = utils.reconstruction_loss(output, x, crop=model.crop_output)
+            recon_loss = utils.reconstruction_loss(output, x_vae, crop=model.crop_output)
             balanced_kl, kl_coeffs, kl_vals = utils.kl_balancer(kl_all, kl_coeff, kl_balance=True, alpha_i=alpha_i)
-
-            nelbo_batch = recon_loss + balanced_kl
+            nelbo_batch = recon_loss + balanced_kl + total_correlation_term
             loss = torch.mean(nelbo_batch)
             norm_loss = model.spectral_norm_parallel()
             bn_loss = model.batchnorm_loss()
             # get spectral regularization coefficient (lambda)
             if args.weight_decay_norm_anneal:
                 assert args.weight_decay_norm_init > 0 and args.weight_decay_norm > 0, 'init and final wdn should be positive.'
-                wdn_coeff = (1. - kl_coeff) * np.log(args.weight_decay_norm_init) + kl_coeff * np.log(args.weight_decay_norm)
+                wdn_coeff = (1. - kl_coeff) * np.log(args.weight_decay_norm_init) + kl_coeff * np.log(
+                    args.weight_decay_norm)
                 wdn_coeff = np.exp(wdn_coeff)
             else:
                 wdn_coeff = args.weight_decay_norm
 
             loss += norm_loss * wdn_coeff + bn_loss * wdn_coeff
 
-        grad_scalar.scale(loss).backward()
-        utils.average_gradients(model.parameters(), args.distributed)
-        grad_scalar.step(cnn_optimizer)
-        grad_scalar.update()
+        if args.cpu_debug:
+            loss.backward(retain_graph=True)
+            cnn_optimizer.step()
+            disc_loss.backward()
+            disc_optimizer.step()
+        else:
+            grad_scalar.scale(loss).backward(retain_graph=True)
+            disc_grad_scaler.scale(disc_loss).backward()
+            utils.average_gradients(model.parameters(), args.distributed)
+            grad_scalar.step(cnn_optimizer)
+            disc_grad_scaler.step(disc_optimizer)
+            grad_scalar.update()
+            disc_grad_scaler.update()
+
+        tc_term = total_correlation_term.detach().mean()
+
         nelbo.update(loss.data, 1)
+        ndisc.update(disc_loss.data, 1)
+        ntc.update(tc_term.data, 1)
 
         if (global_step + 1) % 100 == 0:
             if (global_step + 1) % 1000 == 0:  # reduced frequency
-                n = int(np.floor(np.sqrt(x.size(0))))
-                x_img = x[:n*n]
-                output_img = output.mean if isinstance(output, torch.distributions.bernoulli.Bernoulli) else output.sample()
-                output_img = output_img[:n*n]
+                n = int(np.floor(np.sqrt(x_vae.size(0))))
+                x_img = x_vae[:n * n]
+                output_img = output.mean if isinstance(output,
+                                                       torch.distributions.bernoulli.Bernoulli) else output.sample()
+                output_img = output_img[:n * n]
                 x_tiled = utils.tile_image(x_img, n)
                 output_tiled = utils.tile_image(output_img, n)
                 in_out_tiled = torch.cat((x_tiled, output_tiled), dim=2)
@@ -210,14 +279,21 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
             writer.add_scalar('train/norm_coeff', wdn_coeff, global_step)
 
             utils.average_tensor(nelbo.avg, args.distributed)
-            logging.info('train %d %f', global_step, nelbo.avg)
+            utils.average_tensor(ndisc.avg, args.distributed)
+            # logging.info('train %d %f %f', global_step, nelbo.avg, ndisc.avg)
+            logging.info(
+                f'train step {global_step + 1}, ELBO + TC loss {nelbo.avg} TC loss {ntc.avg}, Disc loss {ndisc.avg}')
             writer.add_scalar('train/nelbo_avg', nelbo.avg, global_step)
+            writer.add_scalar('train/nbatch_avg', ndisc.avg, global_step)
             writer.add_scalar('train/lr', cnn_optimizer.state_dict()[
-                              'param_groups'][0]['lr'], global_step)
+                'param_groups'][0]['lr'], global_step)
             writer.add_scalar('train/nelbo_iter', loss, global_step)
             writer.add_scalar('train/kl_iter', torch.mean(sum(kl_all)), global_step)
-            writer.add_scalar('train/recon_iter', torch.mean(utils.reconstruction_loss(output, x, crop=model.crop_output)), global_step)
+            writer.add_scalar('train/recon_iter',
+                              torch.mean(utils.reconstruction_loss(output, x_vae, crop=model.crop_output)), global_step)
             writer.add_scalar('kl_coeff/coeff', kl_coeff, global_step)
+            writer.add_scalar('train/tc_iter', total_correlation_term.mean().item(), global_step)
+            writer.add_scalar('train/ndisc_iter', disc_loss, global_step)
             total_active = 0
             for i, kl_diag_i in enumerate(kl_diag):
                 utils.average_tensor(kl_diag_i, args.distributed)
@@ -233,46 +309,59 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
         global_step += 1
 
     utils.average_tensor(nelbo.avg, args.distributed)
-    return nelbo.avg, global_step
+    utils.average_tensor(ntc.avg, args.distributed)
+    utils.average_tensor(ndisc.avg, args.distributed)
+
+    return nelbo.avg, ntc.avg, ndisc.avg, global_step
 
 
 def test(valid_queue, model, num_samples, args, logging):
     if args.distributed:
         dist.barrier()
     nelbo_avg = utils.AvgrageMeter()
+    tc_avg = utils.AvgrageMeter()
     neg_log_p_avg = utils.AvgrageMeter()
     model.eval()
-    for step, x in enumerate(valid_queue):
-        x = x[0] if len(x) > 1 else x
-        x = x.cuda()
+    for step, data in enumerate(valid_queue):
+        x_vae = data[0][0] if len(data[0]) > 1 else data[0]
+        x_disc = data[1][0] if len(data[1]) > 1 else data[1]
+        x = torch.cat((x_vae, x_disc))
+        if not args.cpu_debug:
+            x = x.cuda()
 
         # change bit length
         x = utils.pre_process(x, args.num_x_bits)
+        x_vae = x.split(x_vae.shape[0])[0]
 
         with torch.no_grad():
-            nelbo, log_iw = [], []
+            nelbo, log_iw, tc = [], [], []
             for k in range(num_samples):
-                logits, log_q, log_p, kl_all, _ = model(x)
+                # logits, log_q, log_p, kl_all, _ = model(x)
+                logits, log_q, log_p, kl_all, _, total_correlation_term, _ = model(x)
                 output = model.decoder_output(logits)
-                recon_loss = utils.reconstruction_loss(output, x, crop=model.crop_output)
+                recon_loss = utils.reconstruction_loss(output, x_vae, crop=model.crop_output)
                 balanced_kl, _, _ = utils.kl_balancer(kl_all, kl_balance=False)
-                nelbo_batch = recon_loss + balanced_kl
+                nelbo_batch = recon_loss + balanced_kl + total_correlation_term
+                tc.append(total_correlation_term)
                 nelbo.append(nelbo_batch)
-                log_iw.append(utils.log_iw(output, x, log_q, log_p, crop=model.crop_output))
+                log_iw.append(utils.log_iw(output, x_vae, log_q, log_p, crop=model.crop_output))
 
             nelbo = torch.mean(torch.stack(nelbo, dim=1))
+            tc = torch.mean(torch.stack(tc, dim=1))
             log_p = torch.mean(torch.logsumexp(torch.stack(log_iw, dim=1), dim=1) - np.log(num_samples))
 
-        nelbo_avg.update(nelbo.data, x.size(0))
-        neg_log_p_avg.update(- log_p.data, x.size(0))
+        nelbo_avg.update(nelbo.data, x_vae.size(0))
+        tc_avg.update(tc.data, x_vae.size(0))
+        neg_log_p_avg.update(- log_p.data, x_vae.size(0))
 
     utils.average_tensor(nelbo_avg.avg, args.distributed)
+    utils.average_tensor(tc_avg.avg, args.distributed)
     utils.average_tensor(neg_log_p_avg.avg, args.distributed)
     if args.distributed:
         # block to sync
         dist.barrier()
-    logging.info('val, step: %d, NELBO: %f, neg Log p %f', step, nelbo_avg.avg, neg_log_p_avg.avg)
-    return neg_log_p_avg.avg, nelbo_avg.avg
+    logging.info('val, step: %d, NELBO: %f, tc: %f neg Log p %f', step, nelbo_avg.avg, tc_avg.avg, neg_log_p_avg.avg)
+    return neg_log_p_avg.avg, nelbo_avg.avg, tc_avg.avg
 
 
 def create_generator_vae(model, batch_size, num_total_samples):
@@ -297,8 +386,12 @@ def test_vae_fid(model, args, total_fid_samples):
     m, s = compute_statistics_of_generator(g, model, args.batch_size, dims, device, max_samples=num_sample_per_gpu)
 
     # share m and s
-    m = torch.from_numpy(m).cuda()
-    s = torch.from_numpy(s).cuda()
+    m = torch.from_numpy(m)
+    s = torch.from_numpy(s)
+
+    if not args.cpu_debug:
+        m, s = m.cuda(), s.cuda()
+
     # take average across gpus
     utils.average_tensor(m, args.distributed)
     utils.average_tensor(s, args.distributed)
@@ -332,7 +425,7 @@ def cleanup():
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('encoder decoder examiner')
     # experimental results
-    parser.add_argument('--root', type=str, default='/tmp/nasvae/expr',
+    parser.add_argument('--root', type=str, default='/home/vbharg4/NVAE2/run_4',
                         help='location of the results')
     parser.add_argument('--save', type=str, default='exp',
                         help='id used for storing intermediate results')
@@ -342,13 +435,17 @@ if __name__ == '__main__':
                                  'imagenet_32', 'ffhq', 'lsun_bedroom_128', 'stacked_mnist',
                                  'lsun_church_128', 'lsun_church_64'],
                         help='which dataset to use')
-    parser.add_argument('--data', type=str, default='/tmp/nasvae/data',
+    parser.add_argument('--data', type=str, default='/home/vbharg4/NVAE2/data_dir',
                         help='location of the data corpus')
     # optimization
     parser.add_argument('--batch_size', type=int, default=200,
                         help='batch size per GPU')
     parser.add_argument('--learning_rate', type=float, default=1e-2,
                         help='init learning rate')
+    parser.add_argument('--disc_learning_rate', type=float, default=1e-2,
+                        help='init discriminator learning rate')
+    # parser.add_argument('--disc_learning_rate', type=float, default=2e-3,
+    #                     help='init discriminator learning rate')
     parser.add_argument('--learning_rate_min', type=float, default=1e-4,
                         help='min learning rate')
     parser.add_argument('--weight_decay', type=float, default=3e-4,
@@ -368,6 +465,11 @@ if __name__ == '__main__':
                         help='This flag enables using our optimized adamax.')
     parser.add_argument('--arch_instance', type=str, default='res_mbconv',
                         help='path to the architecture instance')
+    # Factor-VAE Gamma value. 1.0 for MNIST.
+    parser.add_argument('--gamma', type=float, default=1.0, help='Total Correlation factor.')
+    parser.add_argument('--tc_type', type=int, default=1, help='How total correlation is calculated. '
+                                                               '0. NO_TC, 1. TC_VIA_PRODUCT_OF_GAUSSIAN_PRODUCTS, '
+                                                               '2. TC_VIA_CAT_OF_SAMPLES \n')
     # KL annealing
     parser.add_argument('--kl_anneal_portion', type=float, default=0.3,
                         help='The portions epochs that KL is annealed')
@@ -433,13 +535,18 @@ if __name__ == '__main__':
                         help='address for master')
     parser.add_argument('--seed', type=int, default=1,
                         help='seed used for initialization')
+    parser.add_argument('--cpu_debug', type=int, default=0)
+
     args = parser.parse_args()
     args.save = args.root + '/eval-' + args.save
     utils.create_exp_dir(args.save)
 
     size = args.num_process_per_node
 
-    if size > 1:
+    if args.cpu_debug:
+        args.distributed = False
+        main(args)
+    elif size > 1:
         args.distributed = True
         processes = []
         for rank in range(size):
@@ -459,5 +566,3 @@ if __name__ == '__main__':
         print('starting in debug mode')
         args.distributed = True
         init_processes(0, size, main, args)
-
-

@@ -129,7 +129,15 @@ class SyncBatchNormSwish(_BatchNorm):
     def forward(self, input):
         # currently only GPU input is supported
         if not input.is_cuda:
-            raise ValueError('SyncBatchNorm expected input tensor to be on GPU')
+            # raise ValueError('SyncBatchNorm expected input tensor to be on GPU')
+            exponential_average_factor = self.momentum if self.momentum else 0.0
+
+            out = F.batch_norm(
+                input, self.running_mean, self.running_var, self.weight, self.bias,
+                self.training or not self.track_running_stats,
+                exponential_average_factor, self.eps)
+
+            return swish.apply(out)
 
         self._check_input_dim(input)
 

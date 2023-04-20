@@ -18,6 +18,7 @@ import os
 import urllib
 from lmdb_datasets import LMDBDataset
 from thirdparty.lsun import LSUN
+import random
 
 
 class StackedMNIST(dset.MNIST):
@@ -88,7 +89,7 @@ def download_omniglot(data_dir):
     filename = 'chardata.mat'
     if not os.path.exists(data_dir):
         os.mkdir(data_dir)
-    url = 'https://raw.github.com/yburda/iwae/master/datasets/OMNIGLOT/chardata.mat'
+    url = 'https://raw.githubusercontent.com/yburda/iwae/master/datasets/OMNIGLOT/chardata.mat'
 
     filepath = os.path.join(data_dir, filename)
     if not os.path.exists(filepath):
@@ -125,6 +126,30 @@ class OMNIGLOT(Dataset):
 
     def __len__(self):
         return len(self.data)
+
+
+class DoubleDatasetWrapper(Dataset):
+    def __init__(self, dataset: dset.VisionDataset):
+        super(Dataset).__init__()
+        self.dataset = dataset
+        self.n = len(self.dataset)
+
+    def __str__(self):
+        return f'DoubleDatasetWrapper for {self.dataset}'
+
+    def __repr__(self):
+        return repr(self.dataset)
+
+    def __len__(self):
+        return self.n
+
+    def __getitem__(self, item):
+        x_vae = self.dataset[item]
+        idx = random.randrange(0, self.n)
+        x_disc = self.dataset[idx]
+
+        return x_vae, x_disc
+
 
 def get_loaders_eval(dataset, args):
     """Get train and valid loaders for cifar10/tiny imagenet."""
@@ -208,6 +233,8 @@ def get_loaders_eval(dataset, args):
         valid_data = LMDBDataset(root=args.data, name='ffhq', train=False, transform=valid_transform)
     else:
         raise NotImplementedError
+
+    train_data, valid_data = DoubleDatasetWrapper(train_data), DoubleDatasetWrapper(valid_data)
 
     train_sampler, valid_sampler = None, None
     if args.distributed:
