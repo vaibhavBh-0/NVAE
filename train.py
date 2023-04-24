@@ -118,12 +118,14 @@ def main(args):
         train_nelbo, train_tc, train_ndisc, global_step = train(train_queue, model, cnn_optimizer, disc_optimizer,
                                                                 grad_scalar, disc_grad_scalar, global_step, warmup_iters
                                                                 , writer, logging, epoch, noise_factor)
-        logging.info('train_nelbo %f %f', train_nelbo, train_ndisc)
+        logging.info('train_nelbo %f train_ndisc %f', train_nelbo, train_ndisc)
         writer.add_scalar('train/nelbo', train_nelbo, global_step)
         writer.add_scalar('train/tc', train_tc, global_step)
         writer.add_scalar('train/ndisc', train_ndisc, global_step)
 
         model.eval()
+        if not args.cpu_debug:
+            torch.cuda.empty_cache()
         # generate samples less frequently
         eval_freq = 1 if args.epochs <= 50 else 20
         if epoch % eval_freq == 0 or epoch == (args.epochs - 1):
@@ -183,6 +185,9 @@ def train(train_queue, model, cnn_optimizer, disc_optimizer, grad_scalar, disc_g
     ntc = utils.AvgrageMeter()
 
     model.train()
+
+    retain_graph = args.tc_type != TCType.NO_TC.value
+
     for step, data in enumerate(train_queue):
         x_vae = data[0][0] if len(data[0]) > 1 else data[0]
         x_disc = data[1][0] if len(data[1]) > 1 else data[1]
@@ -208,17 +213,19 @@ def train(train_queue, model, cnn_optimizer, disc_optimizer, grad_scalar, disc_g
 
         # sync parameters, it may not be necessary
         if step % 100 == 0:
-            utils.average_params(model.parameters(), args.distributed)
+            if retain_graph:
+                utils.average_params(model.parameters(), args.distributed)
+            else:
+                utils.average_params(model.vae_parameters(), args.distributed)
 
-        torch.cuda.empty_cache()
+        if not args.cpu_debug:
+            torch.cuda.empty_cache()
 
         # global_batch_step = epoch * len(train_queue) + step
         # model.noise_val = noise_factor_scheduler(global_batch_step)
 
-        cnn_optimizer.zero_grad()
-        disc_optimizer.zero_grad()
         with autocast(enabled=not args.cpu_debug):
-            logits, log_q, log_p, kl_all, kl_diag, total_correlation_term, disc_loss = model(x)
+            logits, log_q, log_p, kl_all, kl_diag, total_correlation_term = model(x)
 
             output = model.decoder_output(logits)
             kl_coeff = utils.kl_coeff(global_step, args.kl_anneal_portion * args.num_total_iter,
@@ -226,7 +233,12 @@ def train(train_queue, model, cnn_optimizer, disc_optimizer, grad_scalar, disc_g
 
             recon_loss = utils.reconstruction_loss(output, x_vae, crop=model.crop_output)
             balanced_kl, kl_coeffs, kl_vals = utils.kl_balancer(kl_all, kl_coeff, kl_balance=True, alpha_i=alpha_i)
-            nelbo_batch = recon_loss + balanced_kl + total_correlation_term
+
+            if retain_graph:
+                nelbo_batch = recon_loss + balanced_kl + total_correlation_term
+            else:
+                nelbo_batch = recon_loss + balanced_kl
+
             loss = torch.mean(nelbo_batch)
             norm_loss = model.spectral_norm_parallel()
             bn_loss = model.batchnorm_loss()
@@ -241,25 +253,42 @@ def train(train_queue, model, cnn_optimizer, disc_optimizer, grad_scalar, disc_g
 
             loss += norm_loss * wdn_coeff + bn_loss * wdn_coeff
 
-        if args.cpu_debug:
-            loss.backward(retain_graph=True)
-            cnn_optimizer.step()
-            disc_loss.backward()
-            disc_optimizer.step()
-        else:
-            grad_scalar.scale(loss).backward(retain_graph=True)
-            disc_grad_scaler.scale(disc_loss).backward()
-            utils.average_gradients(model.parameters(), args.distributed)
-            grad_scalar.step(cnn_optimizer)
-            disc_grad_scaler.step(disc_optimizer)
-            grad_scalar.update()
-            disc_grad_scaler.update()
+        cnn_optimizer.zero_grad()
 
-        tc_term = total_correlation_term.detach().mean()
+        if args.cpu_debug:
+            loss.backward(retain_graph=retain_graph)
+            cnn_optimizer.step()
+        else:
+            grad_scalar.scale(loss).backward(retain_graph=retain_graph)
+            utils.average_params(model.vae_parameters(), args.distributed)
+            grad_scalar.step(cnn_optimizer)
+            grad_scalar.update()
+
+        if retain_graph:
+            if not args.cpu_debug:
+                torch.cuda.empty_cache()
+
+            with autocast(enabled=not args.cpu_debug):
+                disc_loss = model.forward_disc()
+
+            disc_optimizer.zero_grad()
+
+            if args.cpu_debug:
+                disc_loss.backward()
+                disc_optimizer.step()
+            else:
+                disc_grad_scaler.scale(disc_loss).backward()
+                utils.average_params(model.disc_parameters(), args.distributed)
+                disc_grad_scaler.step(disc_optimizer)
+                disc_grad_scaler.update()
+
+        tc_term = total_correlation_term.detach().mean() if retain_graph else 0.0
+        tc_term /= args.gamma
 
         nelbo.update(loss.data, 1)
-        ndisc.update(disc_loss.data, 1)
-        ntc.update(tc_term.data, 1)
+        if retain_graph:
+            ndisc.update(disc_loss.data, 1)
+            ntc.update(tc_term.data, 1)
 
         if (global_step + 1) % 100 == 0:
             if (global_step + 1) % 1000 == 0:  # reduced frequency
@@ -279,7 +308,8 @@ def train(train_queue, model, cnn_optimizer, disc_optimizer, grad_scalar, disc_g
             writer.add_scalar('train/norm_coeff', wdn_coeff, global_step)
 
             utils.average_tensor(nelbo.avg, args.distributed)
-            utils.average_tensor(ndisc.avg, args.distributed)
+            if retain_graph:
+                utils.average_tensor(ndisc.avg, args.distributed)
             # logging.info('train %d %f %f', global_step, nelbo.avg, ndisc.avg)
             logging.info(
                 f'train step {global_step + 1}, ELBO + TC loss {nelbo.avg} TC loss {ntc.avg}, Disc loss {ndisc.avg}')
@@ -292,8 +322,9 @@ def train(train_queue, model, cnn_optimizer, disc_optimizer, grad_scalar, disc_g
             writer.add_scalar('train/recon_iter',
                               torch.mean(utils.reconstruction_loss(output, x_vae, crop=model.crop_output)), global_step)
             writer.add_scalar('kl_coeff/coeff', kl_coeff, global_step)
-            writer.add_scalar('train/tc_iter', total_correlation_term.mean().item(), global_step)
-            writer.add_scalar('train/ndisc_iter', disc_loss, global_step)
+            writer.add_scalar('train/tc_iter', tc_term.item() if type(tc_term) != float else tc_term, global_step)
+            if retain_graph:
+                writer.add_scalar('train/ndisc_iter', disc_loss, global_step)
             total_active = 0
             for i, kl_diag_i in enumerate(kl_diag):
                 utils.average_tensor(kl_diag_i, args.distributed)
@@ -309,8 +340,9 @@ def train(train_queue, model, cnn_optimizer, disc_optimizer, grad_scalar, disc_g
         global_step += 1
 
     utils.average_tensor(nelbo.avg, args.distributed)
-    utils.average_tensor(ntc.avg, args.distributed)
-    utils.average_tensor(ndisc.avg, args.distributed)
+    if retain_graph:
+        utils.average_tensor(ntc.avg, args.distributed)
+        utils.average_tensor(ndisc.avg, args.distributed)
 
     return nelbo.avg, ntc.avg, ndisc.avg, global_step
 
@@ -322,6 +354,8 @@ def test(valid_queue, model, num_samples, args, logging):
     tc_avg = utils.AvgrageMeter()
     neg_log_p_avg = utils.AvgrageMeter()
     model.eval()
+    if not args.cpu_debug:
+        torch.cuda.empty_cache()
     for step, data in enumerate(valid_queue):
         x_vae = data[0][0] if len(data[0]) > 1 else data[0]
         x_disc = data[1][0] if len(data[1]) > 1 else data[1]
@@ -337,17 +371,21 @@ def test(valid_queue, model, num_samples, args, logging):
             nelbo, log_iw, tc = [], [], []
             for k in range(num_samples):
                 # logits, log_q, log_p, kl_all, _ = model(x)
-                logits, log_q, log_p, kl_all, _, total_correlation_term, _ = model(x)
+                logits, log_q, log_p, kl_all, _, total_correlation_term = model(x)
+
                 output = model.decoder_output(logits)
                 recon_loss = utils.reconstruction_loss(output, x_vae, crop=model.crop_output)
                 balanced_kl, _, _ = utils.kl_balancer(kl_all, kl_balance=False)
-                nelbo_batch = recon_loss + balanced_kl + total_correlation_term
-                tc.append(total_correlation_term)
+                nelbo_batch = recon_loss + balanced_kl
+                if args.tc_type != TCType.NO_TC.value:
+                    nelbo_batch += total_correlation_term
+
+                tc.append(total_correlation_term if args.tc_type != TCType.NO_TC.value else torch.zeros((1, 1), device=nelbo_batch.device))
                 nelbo.append(nelbo_batch)
                 log_iw.append(utils.log_iw(output, x_vae, log_q, log_p, crop=model.crop_output))
 
             nelbo = torch.mean(torch.stack(nelbo, dim=1))
-            tc = torch.mean(torch.stack(tc, dim=1))
+            tc = torch.mean(torch.stack(tc, dim=1)) / args.gamma
             log_p = torch.mean(torch.logsumexp(torch.stack(log_iw, dim=1), dim=1) - np.log(num_samples))
 
         nelbo_avg.update(nelbo.data, x_vae.size(0))
@@ -425,7 +463,7 @@ def cleanup():
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('encoder decoder examiner')
     # experimental results
-    parser.add_argument('--root', type=str, default='/home/vbharg4/NVAE2/run_4',
+    parser.add_argument('--root', type=str, default='/home/vbharg4/NVAE/out_dir',
                         help='location of the results')
     parser.add_argument('--save', type=str, default='exp',
                         help='id used for storing intermediate results')
@@ -435,11 +473,11 @@ if __name__ == '__main__':
                                  'imagenet_32', 'ffhq', 'lsun_bedroom_128', 'stacked_mnist',
                                  'lsun_church_128', 'lsun_church_64'],
                         help='which dataset to use')
-    parser.add_argument('--data', type=str, default='/home/vbharg4/NVAE2/data_dir',
+    parser.add_argument('--data', type=str, default='/home/vbharg4/NVAE/data_dir',
                         help='location of the data corpus')
     # optimization
-    parser.add_argument('--batch_size', type=int, default=200,
-                        help='batch size per GPU')
+    parser.add_argument('--batch_size', type=int, default=120,
+                        help='batch size per GPU') #Original was 200
     parser.add_argument('--learning_rate', type=float, default=1e-2,
                         help='init learning rate')
     parser.add_argument('--disc_learning_rate', type=float, default=1e-2,
@@ -465,11 +503,15 @@ if __name__ == '__main__':
                         help='This flag enables using our optimized adamax.')
     parser.add_argument('--arch_instance', type=str, default='res_mbconv',
                         help='path to the architecture instance')
-    # Factor-VAE Gamma value. 1.0 for MNIST.
-    parser.add_argument('--gamma', type=float, default=1.0, help='Total Correlation factor.')
+    # Factor-VAE Gamma value. 6.0 for MNIST.
+    parser.add_argument('--gamma', type=float, default=6.0, help='Total Correlation factor.')
     parser.add_argument('--tc_type', type=int, default=1, help='How total correlation is calculated. '
                                                                '0. NO_TC, 1. TC_VIA_PRODUCT_OF_GAUSSIAN_PRODUCTS, '
                                                                '2. TC_VIA_CAT_OF_SAMPLES \n')
+    parser.add_argument('--disc_inner_dim', type=int, default=256, help='Inner dimension of discriminator block.')
+    parser.add_argument('--disc_repeat_block', type=int, default=1, help='Repetitions of inner discriminator block.')
+    parser.add_argument('--disc_dropout_block', type=float, default=0.0, help='Dropout rate for inner '
+                                                                             'discriminator block.')
     # KL annealing
     parser.add_argument('--kl_anneal_portion', type=float, default=0.3,
                         help='The portions epochs that KL is annealed')
